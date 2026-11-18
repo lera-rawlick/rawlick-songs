@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <!-- Иконка приложения: тёмный фон, оранжевые «LR» и нотный штрих. PNG-версии собираются из этого файла. -->
+  <rect width="512" height="512" fill="#0E0D0C"/>
+  <circle cx="256" cy="256" r="196" fill="none" stroke="#2c2824" stroke-width="6"/>
+  <text x="256" y="300" text-anchor="middle" font-family="Didot, 'Playfair Display', Georgia, serif" font-size="190" font-style="italic" fill="#FFA22B">LR</text>
+  <path d="M176 352 H336" stroke="#F6F1EA" stroke-width="5" stroke-linecap="round" opacity=".55"/>
+</svg>
