@@ -68,7 +68,8 @@
     s.files = minus[b.id] || [];
     return s;
   }
-  const all = () => CATALOG.concat(added).map(merge);
+  // Удалённые песни каталога помечены hidden и в списках не показываются.
+  const all = () => CATALOG.concat(added).filter((b) => !(user[b.id] && user[b.id].hidden)).map(merge);
   const byId = (id) => {
     const b = CATALOG.find((s) => s.id === id) || added.find((s) => s.id === id);
     return b ? merge(b) : null;
@@ -329,7 +330,7 @@
       st.cur = a;
       st.from = b || 'songs';
       if (prev !== a) Object.assign(st, { open: {}, player: false, confirmDel: false });
-      if (!byId(a)) st.scr = 'songs';
+      if (!byId(a) || byId(a).hidden) st.scr = 'songs';
     }
     if (st.scr === 'add') { st.edit = a || null; st.confirmDel = false; }
     if (st.scr !== 'song' || prev !== st.cur) stopPlay();
@@ -413,7 +414,8 @@
         ${st.from === 'concert' && p > -1 ? `<div class="pn">
           <button data-act="open" data-id="${p > 0 ? F[p - 1].id : ''}" data-from="concert" ${p > 0 ? '' : 'style="visibility:hidden"'}><small>← Предыдущая</small><span>${p > 0 ? esc(F[p - 1].t) : ''}</span></button>
           <button data-act="open" data-id="${p < F.length - 1 ? F[p + 1].id : ''}" data-from="concert" style="text-align:right;${p < F.length - 1 ? '' : 'visibility:hidden'}"><small>Следующая →</small><span>${p < F.length - 1 ? esc(F[p + 1].t) : ''}</span></button></div>` : ''}
-        <div class="row2" style="margin-top:20px"><button class="sbtn" data-act="go" data-to="add:${s.id}">Изменить песню</button></div>`;
+        <div class="row2" style="margin-top:20px"><button class="sbtn" data-act="go" data-to="add:${s.id}">Изменить песню</button>
+          <button class="sbtn danger" data-act="del">${st.confirmDel ? 'Точно удалить? Нажми ещё раз' : 'Удалить песню'}</button></div>`;
     },
 
     add() {
@@ -442,7 +444,7 @@
           <div class="f"><span class="flbl">Куда положить</span><div class="seg"><button type="button" class="${stv === 'know' ? 'on know' : ''}" data-act="pick" data-st="know">Знаю</button><button type="button" class="${stv === 'new' ? 'on new' : ''}" data-act="pick" data-st="new">Новые</button></div></div>
           <button class="btn" style="margin-top:20px" type="submit">Сохранить</button>
         </form>
-        ${s && !isCatalog(s.id) ? `<div class="row2" style="margin-top:14px"><button class="sbtn danger" data-act="del">${st.confirmDel ? 'Точно удалить? Нажми ещё раз' : 'Удалить песню'}</button></div>` : ''}`;
+        ${s ? `<div class="row2" style="margin-top:14px"><button class="sbtn danger" data-act="del">${st.confirmDel ? 'Точно удалить? Нажми ещё раз' : 'Удалить песню'}</button></div>` : ''}`;
     },
 
     load() {
@@ -470,6 +472,11 @@
         <div class="f"><label for="in-mp3">Файлы mp3</label><input id="in-mp3" type="file" accept="audio/*,.mp3,.m4a" multiple></div>
         <p class="a" id="mp3-res"></p>
         </details>
+        ${(() => {
+          const gone = CATALOG.filter((s) => user[s.id] && user[s.id].hidden);
+          return gone.length ? `<h2>Удалённые песни</h2>
+            ${gone.map((s) => `<div class="crow"><span style="flex:1;min-width:0">${esc(s.t)}<span class="a"> · ${esc(s.a)}</span></span><button class="sbtn" data-act="restore" data-id="${s.id}">Вернуть</button></div>`).join('')}` : '';
+        })()}
         <h2>Резервная копия</h2>
         <p class="a">Отметки, тональности, правки и тексты в одном файле (без mp3). Сохрани её в «Файлы» после больших правок.</p>
         <div class="row2"><button class="sbtn" data-act="export">Сохранить копию</button><label class="sbtn" for="in-json">Восстановить из копии</label></div>
@@ -588,6 +595,7 @@
       case 'stanza': if (e.target.closest('a,button')) break; st.open[d.i] = !st.open[d.i]; render(); break;
       case 'pick': st.pick = d.st; el.parentElement.querySelectorAll('button').forEach((b) => (b.className = b === el ? 'on ' + d.st : '')); break;
       case 'del': deleteSong(); break;
+      case 'restore': setUser(d.id, { hidden: false }).then(() => { toast('Песня вернулась'); render(); }); break;
       case 'export': exportBackup(); break;
       case 'translate': translateSong(st.cur); break;
       case 'dl-all': downloadAll(); break;
@@ -649,15 +657,25 @@
     go(`song:${id}:${st.from === 'concert' && old && old.c ? 'concert' : 'songs'}`);
   }
 
+  /**
+   * Удаление в два нажатия. Песню из каталога только прячем (её можно вернуть в «Тексты и минусовки»),
+   * добавленную в приложении удаляем вместе с её минусами.
+   */
   async function deleteSong() {
     if (!st.confirmDel) { st.confirmDel = true; render(); return; }
-    const id = st.edit;
-    added = added.filter((s) => s.id !== id);
-    delete user[id];
-    for (const f of minus[id] || []) await DB.del('mp3:' + f.name).catch(() => {});
-    delete minus[id];
-    await Promise.all([save('added', added), save('user', user), save('minus', minus)]);
-    toast('Песня удалена');
+    const id = st.scr === 'song' ? st.cur : st.edit;
+    stopPlay();
+    if (isCatalog(id)) {
+      await setUser(id, { hidden: true });
+      toast('Песня удалена. Вернуть можно в «Тексты и минусовки»');
+    } else {
+      added = added.filter((s) => s.id !== id);
+      delete user[id];
+      for (const f of minus[id] || []) await DB.del('mp3:' + f.name).catch(() => {});
+      delete minus[id];
+      await Promise.all([save('added', added), save('user', user), save('minus', minus)]);
+      toast('Песня удалена');
+    }
     go('songs');
   }
 
