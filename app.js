@@ -23,7 +23,12 @@
       (opening = new Promise((res, rej) => {
         const r = indexedDB.open('rawlick-songs', 1);
         r.onupgradeneeded = () => r.result.createObjectStore('kv');
-        r.onsuccess = () => res(r.result);
+        r.onsuccess = () => {
+          const db = r.result;
+          // Другая вкладка или сброс данных хотят удалить/обновить базу — отпускаем её, иначе они повиснут.
+          db.onversionchange = () => { db.close(); opening = null; };
+          res(db);
+        };
         r.onerror = () => rej(r.error);
       }));
     const run = (mode, fn) =>
@@ -734,10 +739,13 @@
   async function boot() {
     let k = null;
     try {
-      [user, added, parsed, minus, mt, k] = await Promise.all(['user', 'added', 'parsed', 'minus', 'mt', 'key'].map((x) => DB.get(x)));
+      const load = Promise.all(['user', 'added', 'parsed', 'minus', 'mt', 'key'].map((x) => DB.get(x)));
+      // Если хранилище не отвечает (его держит другая вкладка), не висим на «Загружаю…».
+      const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('не отвечает, закрой другие вкладки с приложением')), 5000));
+      [user, added, parsed, minus, mt, k] = await Promise.race([load, timeout]);
       if (k) key = await importKey(k);
     } catch (e) {
-      toast('Хранилище телефона недоступно: ' + e.message);
+      toast('Хранилище телефона: ' + e.message);
     }
     user = user || {}; added = added || []; parsed = parsed || {}; minus = minus || {}; mt = mt || {};
     // Стартовые отметки «Знаю/Новые» берутся из каталога, пока Лера их не поменяла.

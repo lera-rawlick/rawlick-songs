@@ -1,6 +1,6 @@
 // Работа без интернета: сначала сеть (чтобы обновления приходили сами), при ошибке — копия из кэша.
 // При выпуске новой версии поменяй VERSION, чтобы старый кэш удалился.
-const VERSION = 'rs-v2';
+const VERSION = 'rs-v3';
 const SHELL = ['./', 'index.html', 'app.js', 'core.js', 'songs.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png'];
 
 self.addEventListener('install', (e) => {
