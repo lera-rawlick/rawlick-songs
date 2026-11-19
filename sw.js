@@ -1,7 +1,7 @@
 // Работа без интернета: сначала сеть (чтобы обновления приходили сами), при ошибке — копия из кэша.
 // При выпуске новой версии поменяй VERSION, чтобы старый кэш удалился.
-const VERSION = 'rs-v5';
-const SHELL = ['./', 'index.html', 'app.js', 'core.js', 'songs.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png', 'vendor/soundtouch.js'];
+const VERSION = 'rs-v6';
+const SHELL = ['./', 'index.html', 'app.js', 'core.js', 'songs.js', 'warmups.js', 'manifest.webmanifest', 'icon-192.png', 'icon-512.png', 'apple-touch-icon.png', 'vendor/soundtouch.js'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(VERSION).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));

@@ -420,7 +420,8 @@
   function route() {
     const [scr, a, b] = decodeURIComponent(location.hash.slice(1)).split(':');
     const prev = st.cur;
-    st.scr = ['home', 'songs', 'concert', 'add', 'song', 'load'].includes(scr) ? scr : 'home';
+    st.scr = ['home', 'songs', 'concert', 'add', 'song', 'load', 'warm'].includes(scr) ? scr : 'home';
+    if (st.scr === 'warm' && a) st.wtab = a;
     if (st.scr === 'songs' && a) st.tab = a;
     if (st.scr === 'song') {
       st.cur = a;
@@ -453,6 +454,9 @@
           <div class="tile"><div class="tt">Концерт</div>
             <div>${B.map((b, i) => `<button class="tl" data-act="go" data-to="concert"><span>Блок ${i + 1}</span><span>${b.length}</span></button>`).join('')}</div></div>
         </div>
+        <button class="card-link" data-act="go" data-to="warm">
+          <span>Распевки<small>Сопрано · расщеп · мои</small></span>${I.next}
+        </button>
         <button class="card-link" data-act="go" data-to="load">
           <span>Тексты и минусовки<small>${texts || files ? `Текстов: ${texts} · минусовок: ${files}` : 'Открой по паролю — один раз'}</small></span>${I.next}
         </button>`;
@@ -541,6 +545,29 @@
           <button class="btn" style="margin-top:20px" type="submit">Сохранить</button>
         </form>
         ${s ? `<div class="row2" style="margin-top:14px"><button class="sbtn danger" data-act="del">${st.confirmDel ? 'Точно удалить? Нажми ещё раз' : 'Удалить песню'}</button></div>` : ''}`;
+    },
+
+    warm() {
+      const tab = st.wtab || 'soprano';
+      const list = tab === 'mine' ? myWarm : WARMUPS.filter((w) => w.g === tab).concat(myWarm.filter((w) => w.g === tab));
+      return `
+        <button class="back" data-act="go" data-to="home">${I.back}Главная</button>
+        <h1 style="margin-top:14px">Распевки</h1>
+        <div class="seg" style="margin-top:14px">${[['soprano', 'Сопрано'], ['rasp', 'Расщеп'], ['mine', 'Мои']]
+          .map(([k, l]) => `<button class="${tab === k ? 'on' : ''}" data-act="go" data-to="warm:${k}">${l}</button>`).join('')}</div>
+        ${list.map((w) => `
+          <div class="wv">
+            <a href="https://www.youtube.com/watch?v=${esc(w.id)}" target="_blank" rel="noopener">
+              <img src="https://i.ytimg.com/vi/${esc(w.id)}/mqdefault.jpg" alt="" loading="lazy">
+              <span><b>${esc(w.t)}</b><small>${esc([w.ch, w.len].filter(Boolean).join(' · '))}</small></span></a>
+            ${w.mine ? `<button class="ghost" data-act="warm-del" data-id="${esc(w.id)}" aria-label="Удалить распевку">✕</button>` : ''}
+          </div>`).join('') || '<p class="empty">Своих пока нет — добавь ссылку ниже.</p>'}
+        <h2>Добавить свою</h2>
+        <form id="warmf">
+          <div class="f"><label for="w-url">Ссылка на YouTube</label><input id="w-url" type="url" placeholder="https://youtu.be/…" autocapitalize="none"><span class="err" id="w-err" hidden>Нужна ссылка на видео YouTube</span></div>
+          <div class="f"><label for="w-g">Куда</label><select id="w-g"><option value="mine">Мои</option><option value="soprano" ${tab === 'soprano' ? 'selected' : ''}>Сопрано</option><option value="rasp" ${tab === 'rasp' ? 'selected' : ''}>Расщеп</option></select></div>
+          <button class="btn" style="margin-top:12px" type="submit">Добавить</button>
+        </form>`;
     },
 
     load() {
@@ -702,6 +729,7 @@
       case 'stanza': if (e.target.closest('a,button')) break; st.open[d.i] = !st.open[d.i]; render(); break;
       case 'pick': st.pick = d.st; el.parentElement.querySelectorAll('button').forEach((b) => (b.className = b === el ? 'on ' + d.st : '')); break;
       case 'del': deleteSong(); break;
+      case 'warm-del': myWarm = myWarm.filter((w) => w.id !== d.id); save('warm', myWarm); render(); toast('Распевка удалена'); break;
       case 'restore': setUser(d.id, { hidden: false }).then(() => { toast('Песня вернулась'); render(); }); break;
       case 'export': exportBackup(); break;
       case 'translate': translateSong(st.cur); break;
@@ -723,6 +751,7 @@
 
   document.addEventListener('submit', (e) => {
     if (e.target.id === 'unlockf') { e.preventDefault(); unlock(document.getElementById('pw').value); return; }
+    if (e.target.id === 'warmf') { e.preventDefault(); addWarm(); return; }
     if (e.target.id !== 'songf') return;
     e.preventDefault();
     saveForm();
@@ -785,6 +814,28 @@
       toast('Песня удалена');
     }
     go('songs');
+  }
+
+  // ---------- Свои распевки ----------
+  let myWarm = []; // [{id, g, t, ch, mine: true}] — хранятся в телефоне под ключом 'warm'
+
+  /** id видео из любой ссылки YouTube: youtu.be/ID, watch?v=ID, shorts/ID, embed/ID. */
+  const ytId = (u) => (String(u).match(/(?:youtu\.be\/|[?&]v=|shorts\/|embed\/|live\/)([\w-]{11})/) || [])[1] || null;
+
+  async function addWarm() {
+    const url = document.getElementById('w-url').value.trim();
+    const id = ytId(url);
+    if (!id) { document.getElementById('w-err').hidden = false; return; }
+    const g = document.getElementById('w-g').value;
+    let t = 'Распевка', ch = '';
+    try { // название и канал подтягиваем у YouTube; без интернета останется «Распевка»
+      const j = await (await fetch('https://www.youtube.com/oembed?format=json&url=' + encodeURIComponent('https://youtu.be/' + id))).json();
+      t = j.title || t; ch = j.author_name || '';
+    } catch { /* без названия тоже работает */ }
+    myWarm = myWarm.filter((w) => w.id !== id).concat({ id, g, t, ch, mine: true });
+    await save('warm', myWarm);
+    toast('Распевка добавлена');
+    go('warm:' + g);
   }
 
   // ---------- Загрузка файлов ----------
@@ -865,15 +916,15 @@
   async function boot() {
     let k = null;
     try {
-      const load = Promise.all(['user', 'added', 'parsed', 'minus', 'mt', 'key', 'pitch'].map((x) => DB.get(x)));
+      const load = Promise.all(['user', 'added', 'parsed', 'minus', 'mt', 'key', 'pitch', 'warm'].map((x) => DB.get(x)));
       // Если хранилище не отвечает (его держит другая вкладка), не висим на «Загружаю…».
       const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('не отвечает, закрой другие вкладки с приложением')), 5000));
-      [user, added, parsed, minus, mt, k, pitch] = await Promise.race([load, timeout]);
+      [user, added, parsed, minus, mt, k, pitch, myWarm] = await Promise.race([load, timeout]);
       if (k) key = await importKey(k);
     } catch (e) {
       toast('Хранилище телефона: ' + e.message);
     }
-    user = user || {}; added = added || []; parsed = parsed || {}; minus = minus || {}; mt = mt || {}; pitch = pitch || {};
+    user = user || {}; added = added || []; parsed = parsed || {}; minus = minus || {}; mt = mt || {}; pitch = pitch || {}; myWarm = myWarm || [];
     // Стартовые отметки «Знаю/Новые» берутся из каталога, пока Лера их не поменяла.
     route();
     // Новая версия текстов на сайте подтягивается тихо; без интернета просто остаёмся на сохранённой.
