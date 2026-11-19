@@ -38,9 +38,34 @@ test('каталог: уникальные id, концерт 3 блока по 
 });
 
 test('строфы: припев по 😈 и по повтору', () => {
-  const st = Core.stanzas('♥️Строка один\nстрока два\n\n😈Припев раз\nприпев два\n\nКуплет\nещё\n\nПрипев раз\nприпев два');
+  const st = Core.stanzas('♥\uFE0FСтрока один\nстрока два\n\n😈Припев раз\nприпев два\n\nКуплет\nещё\n\nПрипев раз\nприпев два');
   assert.equal(st.length, 4);
   assert.deepEqual(st.map((s) => s.chorus), [false, true, false, true]);
+});
+
+test('шифрование: расшифровка своим паролем и отказ чужому', async () => {
+  const salt = Core.b64enc(new Uint8Array(16).fill(7));
+  const key = await Core.deriveKey('abcd-efgh', salt, 1000);
+  const box = await Core.encrypt(key, new TextEncoder().encode('Припев'));
+  assert.equal(new TextDecoder().decode(await Core.decrypt(key, box)), 'Припев');
+  const same = await Core.importKey(await Core.exportKey(key)); // ключ, сохранённый в телефоне
+  assert.equal(new TextDecoder().decode(await Core.decrypt(same, box)), 'Припев');
+  const wrong = await Core.deriveKey('abcd-efgX', salt, 1000);
+  await assert.rejects(Core.decrypt(wrong, box));
+});
+
+const PASS = path.join(__dirname, '..', '.pack-password');
+test('упаковка data/: тексты и минусовки расшифровываются паролем', { skip: !fs.existsSync(PASS) }, async () => {
+  const data = path.join(__dirname, '..', 'data');
+  const meta = JSON.parse(fs.readFileSync(path.join(data, 'meta.json'), 'utf8'));
+  const key = await Core.deriveKey(fs.readFileSync(PASS, 'utf8'), meta.salt, meta.iter);
+  const pack = JSON.parse(new TextDecoder().decode(await Core.decrypt(key, fs.readFileSync(path.join(data, 'texts.bin')))));
+  assert.ok(Object.keys(pack.parsed).length >= 40);
+  const files = Object.values(pack.minus).flat();
+  assert.ok(files.length >= 30);
+  for (const f of files) assert.ok(fs.existsSync(path.join(__dirname, '..', f.src)), f.src);
+  const mp3 = await Core.decrypt(key, fs.readFileSync(path.join(__dirname, '..', files[0].src)));
+  assert.equal(String.fromCharCode(mp3[0], mp3[1], mp3[2]) === 'ID3' || (mp3[0] === 0xff && (mp3[1] & 0xe0) === 0xe0), true, 'это mp3');
 });
 
 test('минусовки: номер сдвига из имени', () => {

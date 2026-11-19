@@ -13,7 +13,7 @@
  */
 (function () {
   'use strict';
-  const { keyShift, shiftText, prettyKey, norm, decode, parseNotes, stanzas, matchMinus, minusShift } = Core;
+  const { keyShift, shiftText, prettyKey, norm, decode, parseNotes, stanzas, matchMinus, minusShift, deriveKey, decrypt, exportKey, importKey, b64dec } = Core;
 
   // ---------- Хранилище ----------
   const DB = (() => {
@@ -43,8 +43,10 @@
     };
   })();
 
-  let user = {}, added = [], parsed = {}, minus = {};
-  const save = (key, val) => DB.set(key, val).catch((e) => toast('Не удалось сохранить: ' + e.message));
+  // mt — машинные переводы { id: {text, src: 'lyrics'|'orig'} }; key — ключ к зашифрованным данным сайта.
+  let user = {}, added = [], parsed = {}, minus = {}, mt = {};
+  let key = null;
+  const save = (k, val) => DB.set(k, val).catch((e) => toast('Не удалось сохранить: ' + e.message));
 
   // ---------- Песни ----------
   const TEXT = ['notes', 'lyrics', 'tr', 'orig'];
@@ -55,6 +57,8 @@
     const u = user[b.id] || {}, p = parsed[b.id] || {};
     const s = Object.assign({}, b, u);
     for (const f of TEXT) s[f] = u[f] != null ? u[f] : b[f] != null ? b[f] : p[f] || '';
+    // Свой перевод (из заметки или формы) важнее машинного.
+    if (!s.tr && mt[b.id]) { s.tr = mt[b.id].text; s.mt = mt[b.id].src; }
     s.my = s.my || [];
     s.files = minus[b.id] || [];
     return s;
@@ -117,14 +121,141 @@
   const cache = {}; // имя файла → { url, file }
   let playing = null; // имя играющего файла
 
+  const loading = new Set(); // минусы, которые сейчас скачиваются
+  const remote = (name) => Object.values(minus).flat().find((x) => x.name === name && x.src);
+
+  /** Минус из телефона, а если его там ещё нет — скачивает с сайта, расшифровывает и кладёт в телефон. */
+  async function getMinus(name) {
+    const rec = await DB.get('mp3:' + name).catch(() => null);
+    if (rec) return rec;
+    const f = remote(name);
+    if (!f || !key) return null;
+    const r = await fetch(f.src);
+    if (!r.ok) throw new Error('сайт ответил ' + r.status);
+    const fresh = { buf: (await decrypt(key, await r.arrayBuffer())).buffer, type: f.type || 'audio/mpeg' };
+    await DB.set('mp3:' + name, fresh);
+    return fresh;
+  }
+
   async function warm(names) {
     for (const name of names) {
-      if (cache[name]) continue;
-      const rec = await DB.get('mp3:' + name).catch(() => null);
-      if (!rec) continue;
-      const file = new File([rec.buf], name, { type: rec.type || 'audio/mpeg' });
-      cache[name] = { file, url: URL.createObjectURL(file) };
+      if (cache[name] || loading.has(name)) continue;
+      loading.add(name);
+      paintPlayer();
+      try {
+        const rec = await getMinus(name);
+        if (rec) {
+          const file = new File([rec.buf], name, { type: rec.type || 'audio/mpeg' });
+          cache[name] = { file, url: URL.createObjectURL(file) };
+        }
+      } catch (e) {
+        toast('Минус не скачался: ' + (navigator.onLine ? e.message : 'нет интернета'));
+      } finally {
+        loading.delete(name);
+      }
     }
+  }
+
+  // ---------- Зашифрованные тексты и минусовки с сайта ----------
+  /** Подтягивает тексты и список минусовок, если на сайте новая версия (или force). */
+  async function syncPack(force) {
+    if (!key) return false;
+    const meta = await (await fetch('data/meta.json', { cache: 'no-store' })).json();
+    if (!force && meta.v === (await DB.get('packV'))) return false;
+    const r = await fetch('data/texts.bin?v=' + meta.v);
+    if (!r.ok) throw new Error('сайт ответил ' + r.status);
+    const pack = JSON.parse(new TextDecoder().decode(await decrypt(key, await r.arrayBuffer())));
+    parsed = pack.parsed || {};
+    // Минусовки с сайта плюс те, что Лера загрузила в телефон сама.
+    const next = {};
+    for (const [id, list] of Object.entries(pack.minus || {})) next[id] = list.slice();
+    for (const [id, list] of Object.entries(minus)) {
+      for (const f of list) if (!f.src && !(next[id] || []).some((x) => x.name === f.name)) (next[id] = next[id] || []).push(f);
+    }
+    minus = next;
+    await Promise.all([save('parsed', parsed), save('minus', minus), DB.set('packV', meta.v)]);
+    return true;
+  }
+
+  async function unlock(pass) {
+    const out = document.getElementById('pw-res');
+    out.textContent = 'Проверяю…';
+    try {
+      const meta = await (await fetch('data/meta.json', { cache: 'no-store' })).json();
+      const k = await deriveKey(pass, meta.salt, meta.iter);
+      try { await decrypt(k, b64dec(meta.check)); }
+      catch { out.innerHTML = '<span class="err">Неверный пароль. Проверь буквы и дефисы.</span>'; return; }
+      key = k;
+      await DB.set('key', await exportKey(k));
+      await syncPack(true);
+      if (navigator.storage && navigator.storage.persist) navigator.storage.persist();
+      toast('Тексты и минусовки открыты');
+      go('home');
+    } catch (e) {
+      out.innerHTML = `<span class="err">Не получилось: ${esc(navigator.onLine ? e.message : 'нет интернета')}.</span>`;
+    }
+  }
+
+  /** Скачивает все минусовки в телефон заранее, чтобы на концерте всё работало без интернета. */
+  async function downloadAll() {
+    const names = Object.values(minus).flat().filter((f) => f.src).map((f) => f.name);
+    const out = document.getElementById('dl-res');
+    let ok = 0;
+    for (const [i, name] of names.entries()) {
+      out.textContent = `Скачиваю ${i + 1} из ${names.length}…`;
+      try { if (await getMinus(name)) ok++; } catch (e) { /* сообщим общим итогом ниже */ }
+    }
+    out.innerHTML = ok === names.length ? '<span class="ok">Все минусовки в телефоне — работают без интернета.</span>' : `<span class="err">Скачано ${ok} из ${names.length}. Проверь интернет и нажми ещё раз.</span>`;
+  }
+
+  // ---------- Машинный перевод ----------
+  /** Переводит строки на русский: Google без ключа, запасной вариант — MyMemory по строке. */
+  async function mtLines(lines) {
+    try {
+      const r = await fetch('https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=ru&dt=t&q=' + encodeURIComponent(lines.join('\n')));
+      if (!r.ok) throw new Error('переводчик ответил ' + r.status);
+      const j = await r.json();
+      return j[0].map((x) => x[0]).join('').replace(/\n$/, '').split('\n');
+    } catch (e) {
+      const out = [];
+      for (const l of lines) {
+        const r = await fetch('https://api.mymemory.translated.net/get?langpair=en|ru&q=' + encodeURIComponent(l));
+        const j = await r.json();
+        if (!j.responseData) throw e;
+        out.push(j.responseData.translatedText);
+      }
+      return out;
+    }
+  }
+
+  let translating = false;
+  /** Перевод по строфам; если пою по транскрипции — переводится «Оригинал» и показывается отдельным блоком. */
+  async function translateSong(id) {
+    if (translating) return;
+    const s = byId(id);
+    const fromOrig = !isLatin(s.lyrics) && !!s.orig;
+    const src = fromOrig ? s.orig : s.lyrics;
+    if (!src) { toast('Сначала нужен текст'); return; }
+    translating = true;
+    const btn = document.querySelector('[data-act="translate"]');
+    try {
+      const L = stanzas(src);
+      const parts = [];
+      for (const [i, b] of L.entries()) {
+        if (btn) btn.textContent = `Перевожу ${i + 1} из ${L.length}…`;
+        const lines = b.lines.map((l) => l.replace(MARK_RE, '').replace(/\([^)]*[а-яё][^)]*\)/gi, '').trim() || '·');
+        let tr = await mtLines(lines);
+        if (tr.length !== lines.length) tr = [tr.join(' ')]; // строки не совпали — покажем блоком после строфы
+        parts.push(tr.map((x) => x.trim() || '·').join('\n'));
+      }
+      mt[id] = { text: parts.join('\n\n'), src: fromOrig ? 'orig' : 'lyrics' };
+      await save('mt', mt);
+      st.tr = true;
+    } catch (e) {
+      toast('Перевод не получился: ' + (navigator.onLine ? e.message : 'нет интернета'));
+    }
+    translating = false;
+    render();
   }
 
   function togglePlay(name) {
@@ -169,7 +300,8 @@
       const mine = bar.dataset.name === playing;
       bar.firstElementChild.style.width = mine && audio.duration ? (audio.currentTime / audio.duration) * 100 + '%' : '0';
       const t = bar.nextElementSibling;
-      if (t) t.textContent = mine ? fmtTime(audio.currentTime) + ' / ' + fmtTime(audio.duration) : '';
+      const name = bar.dataset.name;
+      if (t) t.textContent = mine ? fmtTime(audio.currentTime) + ' / ' + fmtTime(audio.duration) : loading.has(name) && !cache[name] ? 'Скачиваю…' : '';
     });
   }
   audio.addEventListener('timeupdate', paintPlayer);
@@ -220,7 +352,7 @@
             <div>${B.map((b, i) => `<button class="tl" data-act="go" data-to="concert"><span>Блок ${i + 1}</span><span>${b.length}</span></button>`).join('')}</div></div>
         </div>
         <button class="card-link" data-act="go" data-to="load">
-          <span>Тексты и минусовки<small>${texts || files ? `Текстов: ${texts} · минусовок: ${files}` : 'Загрузи заметку и mp3 из «Файлов»'}</small></span>${I.next}
+          <span>Тексты и минусовки<small>${texts || files ? `Текстов: ${texts} · минусовок: ${files}` : 'Открой по паролю — один раз'}</small></span>${I.next}
         </button>`;
     },
 
@@ -268,9 +400,10 @@
         ${st.player ? `<div class="box" style="margin-top:8px">${hasMinus ? playerHTML(s) : `<p class="a" style="margin:0">Минуса пока нет. Загрузи mp3 в «Тексты и минусовки» или добавь ссылку в «Изменить».</p>`}</div>` : ''}
         <div class="lyh"><span class="lbl" style="font-size:12px">Текст</span>
           <div class="sws">
-            ${s.tr ? `<button class="sw ${st.tr ? 'on' : ''}" data-act="sw" data-k="tr" aria-pressed="${st.tr}"><i></i>Перевод</button>` : `<a class="sbtn" href="${google('amalgama-lab ' + q + ' перевод')}" target="_blank" rel="noopener">Найти перевод</a>`}
+            ${s.tr ? `<button class="sw ${st.tr ? 'on' : ''}" data-act="sw" data-k="tr" aria-pressed="${st.tr}"><i></i>Перевод</button>` : s.lyrics || s.orig ? `<button class="sbtn" data-act="translate">Перевести</button>` : ''}
             ${s.orig ? `<button class="sw ${st.orig ? 'on' : ''}" data-act="sw" data-k="orig" aria-pressed="${st.orig}"><i></i>Оригинал</button>` : ''}
           </div></div>
+        ${s.mt && st.tr ? `<p class="cue" style="margin:-4px 0 12px">Машинный перевод. Свой можно вставить в «Изменить песню».</p>` : ''}
         ${lyricsHTML(s)}
         ${st.from === 'concert' && p > -1 ? `<div class="pn">
           <button data-act="open" data-id="${p > 0 ? F[p - 1].id : ''}" data-from="concert" ${p > 0 ? '' : 'style="visibility:hidden"'}><small>← Предыдущая</small><span>${p > 0 ? esc(F[p - 1].t) : ''}</span></button>
@@ -313,11 +446,16 @@
       return `
         <button class="back" data-act="go" data-to="home">${I.back}Главная</button>
         <h1 style="margin-top:14px">Тексты и минусовки</h1>
-        <p class="sub">Всё это хранится только в телефоне и работает без интернета.</p>
-        <ol class="steps">
-          <li>Открой «Файлы» → iCloud Drive → папка «Песни».</li>
-          <li>Ниже выбери заметку «Новая.txt», потом все mp3.</li>
-        </ol>
+        <p class="sub">На сайте они зашифрованы. Открываются паролем один раз, дальше хранятся в телефоне.</p>
+        <h2>Пароль</h2>
+        ${key
+          ? `<p class="a"><span class="ok">Открыто: текстов ${texts}, минусовок ${files}.</span> Новые версии с сайта подтягиваются сами.</p>
+             <p class="a">Каждый минус скачивается, когда первый раз нажимаешь «Мой минус». Перед концертом лучше скачать все сразу (около 200 МБ, по Wi-Fi).</p>
+             <div class="row2"><button class="sbtn" data-act="dl-all">Скачать все минусовки</button></div><p class="a" id="dl-res"></p>`
+          : `<form id="unlockf"><div class="f"><label for="pw">Пароль</label><input id="pw" type="password" autocomplete="current-password" autocapitalize="none" spellcheck="false" placeholder="xxxx-xxxx-xxxx"></div>
+             <button class="btn" style="margin-top:12px" type="submit">Открыть тексты и минусовки</button></form><p class="a" id="pw-res"></p>`}
+        <details class="notes" style="margin-top:22px"><summary>Загрузить свои файлы вручную</summary>
+        <p class="a">Если поменяла заметку или появились новые mp3: «Файлы» → iCloud Drive → «Песни».</p>
         <h2>1. Тексты из заметки</h2>
         <p class="a" id="txt-st">${texts ? `<span class="ok">Загружено песен с текстом: ${texts}.</span> Загрузишь снова — тексты обновятся, твои правки в приложении останутся.` : 'Ещё не загружены.'}</p>
         <div class="f"><label for="in-txt">Файл заметки (.txt)</label><input id="in-txt" type="file" accept=".txt,text/plain"></div>
@@ -326,7 +464,8 @@
         <p class="a" id="mp3-st">${files ? `<span class="ok">Загружено минусовок: ${files}.</span>` : 'Ещё не загружены.'} Можно выбрать все файлы сразу — приложение само разложит их по песням.</p>
         <div class="f"><label for="in-mp3">Файлы mp3</label><input id="in-mp3" type="file" accept="audio/*,.mp3,.m4a" multiple></div>
         <p class="a" id="mp3-res"></p>
-        <h2>3. Резервная копия</h2>
+        </details>
+        <h2>Резервная копия</h2>
         <p class="a">Отметки, тональности, правки и тексты в одном файле (без mp3). Сохрани её в «Файлы» после больших правок.</p>
         <div class="row2"><button class="sbtn" data-act="export">Сохранить копию</button><label class="sbtn" for="in-json">Восстановить из копии</label></div>
         <input id="in-json" type="file" accept=".json,application/json" hidden>`;
@@ -373,19 +512,24 @@
         <div class="row2"><a class="sbtn" href="${google(q + ' lyrics')}" target="_blank" rel="noopener">Найти текст</a><button class="sbtn" data-act="go" data-to="add:${s.id}">Вставить текст</button></div>`;
     }
     const latin = isLatin(s.lyrics);
-    const TR = s.tr ? stanzas(s.tr) : [], OR = s.orig ? stanzas(s.orig) : [];
-    return L.map((b, bi) => {
+    // Машинный перевод «Оригинала» (песня записана транскрипцией) по строфам не совпадёт — показываем его целиком в конце.
+    const trWhole = s.mt === 'orig';
+    const TR = s.tr && !trWhole ? stanzas(s.tr) : [], OR = s.orig ? stanzas(s.orig) : [];
+    const body = L.map((b, bi) => {
       const layers = [];
       if (TR[bi] && (st.tr || st.open[bi])) layers.push(['tr', TR[bi]]);
       if (OR[bi] && st.orig) layers.push(['or', OR[bi]]);
       const lines = b.lines.map((l, li) => {
         let h = lineHTML(l, latin);
-        if (h) for (const [cls, t] of layers) if (t.lines.length === b.lines.length) h += `<span class="${cls}">${clean(t.lines[li])}</span>`;
+        // под служебными пометками (тайминги, техника) перевод не нужен
+        if (h && !h.startsWith('<p class="cue"')) for (const [cls, t] of layers) if (t.lines.length === b.lines.length) h += `<span class="${cls}">${clean(t.lines[li])}</span>`;
         return h;
       }).join('');
       const after = layers.filter(([, t]) => t.lines.length !== b.lines.length).map(([cls, t]) => `<div class="${cls} blk">${t.lines.map(clean).join('<br>')}</div>`).join('');
       return `<div class="stanza ${b.chorus ? 'chorus' : ''}" data-act="stanza" data-i="${bi}">${b.chorus ? '<div class="lbl">Припев</div>' : ''}${lines}${after}</div>`;
     }).join('');
+    const whole = trWhole && st.tr ? `<div class="box"><div class="lbl" style="margin-bottom:6px">Перевод</div>${stanzas(s.tr).map((b) => `<p class="tr">${b.lines.map(clean).join('<br>')}</p>`).join('')}</div>` : '';
+    return body + whole;
   }
 
   function list() {
@@ -440,6 +584,8 @@
       case 'pick': st.pick = d.st; el.parentElement.querySelectorAll('button').forEach((b) => (b.className = b === el ? 'on ' + d.st : '')); break;
       case 'del': deleteSong(); break;
       case 'export': exportBackup(); break;
+      case 'translate': translateSong(st.cur); break;
+      case 'dl-all': downloadAll(); break;
     }
   });
 
@@ -455,6 +601,7 @@
   });
 
   document.addEventListener('submit', (e) => {
+    if (e.target.id === 'unlockf') { e.preventDefault(); unlock(document.getElementById('pw').value); return; }
     if (e.target.id !== 'songf') return;
     e.preventDefault();
     saveForm();
@@ -585,14 +732,18 @@
 
   // ---------- Запуск ----------
   async function boot() {
+    let k = null;
     try {
-      [user, added, parsed, minus] = await Promise.all(['user', 'added', 'parsed', 'minus'].map((k) => DB.get(k)));
+      [user, added, parsed, minus, mt, k] = await Promise.all(['user', 'added', 'parsed', 'minus', 'mt', 'key'].map((x) => DB.get(x)));
+      if (k) key = await importKey(k);
     } catch (e) {
       toast('Хранилище телефона недоступно: ' + e.message);
     }
-    user = user || {}; added = added || []; parsed = parsed || {}; minus = minus || {};
+    user = user || {}; added = added || []; parsed = parsed || {}; minus = minus || {}; mt = mt || {};
     // Стартовые отметки «Знаю/Новые» берутся из каталога, пока Лера их не поменяла.
     route();
+    // Новая версия текстов на сайте подтягивается тихо; без интернета просто остаёмся на сохранённой.
+    syncPack(false).then((changed) => { if (changed) render(); }).catch(() => {});
   }
   boot();
   if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js');

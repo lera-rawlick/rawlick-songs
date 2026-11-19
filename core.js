@@ -225,7 +225,38 @@
     return m ? parseInt(m[1].replace(/\s/g, ''), 10) : null;
   }
 
-  const Core = { keyIndex, keyShift, shiftText, prettyKey, norm, decode, parseNotes, stanzas, matchMinus, minusShift, isNote };
+  // --- Шифрование ----------------------------------------------------------
+  // Тексты и минусовки лежат на публичном сайте только зашифрованными (AES-GCM, ключ из пароля через PBKDF2).
+  // Формат зашифрованного файла: 12 байт IV, затем шифротекст с тегом. Код общий для node (упаковка) и телефона.
+
+  const subtle = () => globalThis.crypto.subtle;
+  const b64enc = (u8) => btoa(String.fromCharCode(...u8));
+  const b64dec = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+
+  async function deriveKey(pass, saltB64, iter) {
+    const base = await subtle().importKey('raw', new TextEncoder().encode(String(pass).trim()), 'PBKDF2', false, ['deriveKey']);
+    return subtle().deriveKey({ name: 'PBKDF2', salt: b64dec(saltB64), iterations: iter, hash: 'SHA-256' }, base, { name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+  }
+  async function encrypt(key, data) {
+    const iv = globalThis.crypto.getRandomValues(new Uint8Array(12));
+    const ct = new Uint8Array(await subtle().encrypt({ name: 'AES-GCM', iv }, key, data));
+    const out = new Uint8Array(12 + ct.length);
+    out.set(iv);
+    out.set(ct, 12);
+    return out;
+  }
+  /** Неверный ключ или испорченный файл → исключение (OperationError). */
+  async function decrypt(key, data) {
+    const b = new Uint8Array(data);
+    return new Uint8Array(await subtle().decrypt({ name: 'AES-GCM', iv: b.subarray(0, 12) }, key, b.subarray(12)));
+  }
+  const exportKey = async (key) => b64enc(new Uint8Array(await subtle().exportKey('raw', key)));
+  const importKey = (b64) => subtle().importKey('raw', b64dec(b64), 'AES-GCM', true, ['encrypt', 'decrypt']);
+
+  const Core = {
+    keyIndex, keyShift, shiftText, prettyKey, norm, decode, parseNotes, stanzas, matchMinus, minusShift, isNote,
+    b64enc, b64dec, deriveKey, encrypt, decrypt, exportKey, importKey,
+  };
   root.Core = Core;
   if (typeof module !== 'undefined') module.exports = Core;
 })(typeof window !== 'undefined' ? window : globalThis);
