@@ -264,15 +264,111 @@
     render();
   }
 
-  function togglePlay(name) {
-    if (playing === name && !audio.paused) { audio.pause(); return paintPlayer(); }
-    const c = cache[name];
-    if (!c) { toast('Файл ещё загружается, нажми ещё раз'); warm([name]).then(paintPlayer); return; }
-    if (playing !== name) { audio.src = c.url; playing = name; }
-    audio.play().catch(() => toast('Не получилось включить звук'));
+  // ---------- Сдвиг тональности минуса, как на x-minus ----------
+  // При сдвиге 0 играет обычный <audio> (лучшее качество, играет и при выключенном экране).
+  // При сдвиге ≠ 0 — Web Audio + SoundTouch (vendor/soundtouch.js, LGPL): тон меняется, темп нет.
+  let pitch = {}; // имя файла → полутоны (−6…+6), хранится в телефоне
+  let engine = 'audio'; // чем играет текущий файл: 'audio' | 'shift'
+  let actx = null, gain = null, shifter = null, shiftOn = false, decoded = null, ST = null;
+  const getPitch = (name) => pitch[name] || 0;
+  const pitchLabel = (n) => (n === 0 ? 'как в файле' : shiftText(n));
+  const isPlaying = () => (engine === 'shift' ? shiftOn : !audio.paused);
+  const pos = () => (engine === 'shift' && shifter ? shifter.timePlayed : audio.currentTime);
+  const dur = () => (engine === 'shift' && decoded ? decoded.buf.duration : audio.duration);
+
+  /** iOS запускает звук Web Audio только из нажатия — создаём и будим контекст синхронно в обработчике. */
+  function unlockAudio() {
+    if (!actx) {
+      actx = new (window.AudioContext || window.webkitAudioContext)();
+      gain = actx.createGain();
+      gain.connect(actx.destination);
+    }
+    if (navigator.audioSession) navigator.audioSession.type = 'playback'; // играть и в беззвучном режиме
+    if (actx.state !== 'running') actx.resume();
+  }
+
+  function dropShifter() {
+    if (shifter) { shifter.disconnect(); shifter = null; }
+    shiftOn = false;
+  }
+
+  async function startShift(name, from) {
+    try {
+      if (!shifter || !decoded || decoded.name !== name) {
+        ST = ST || (await import('./vendor/soundtouch.js'));
+        if (!decoded || decoded.name !== name) {
+          decoded = null;
+          decoded = { name, buf: await actx.decodeAudioData(await cache[name].file.arrayBuffer()) };
+        }
+        dropShifter();
+        let ended = false;
+        shifter = new ST.PitchShifter(actx, decoded.buf, 4096, () => {
+          if (ended) return;
+          ended = true;
+          dropShifter();
+          paintPlayer();
+        });
+        shifter.percentagePlayed = Math.min(from / decoded.buf.duration, 0.999);
+        shifter.on('play', paintPlayer);
+      }
+      if (playing !== name || engine !== 'shift') return; // пока готовились, нажали другое
+      shifter.pitchSemitones = getPitch(name);
+      shifter.connect(gain);
+      shiftOn = true;
+    } catch (e) {
+      toast('Не получилось сдвинуть тон: ' + e.message);
+    }
     paintPlayer();
   }
-  function stopPlay() { audio.pause(); playing = null; }
+
+  function togglePlay(name) {
+    if (playing === name && isPlaying()) { pauseAll(); return paintPlayer(); }
+    const c = cache[name];
+    if (!c) { toast('Файл ещё загружается, нажми ещё раз'); warm([name]).then(paintPlayer); return; }
+    const from = playing === name ? pos() || 0 : 0;
+    if (getPitch(name) === 0 && !(engine === 'shift' && playing === name && shifter)) {
+      dropShifter();
+      if (playing !== name || engine !== 'audio') { audio.src = c.url; audio.currentTime = from; }
+      engine = 'audio';
+      playing = name;
+      audio.play().catch(() => toast('Не получилось включить звук'));
+    } else {
+      unlockAudio();
+      audio.pause();
+      if (playing !== name) dropShifter();
+      engine = 'shift';
+      playing = name;
+      startShift(name, from);
+    }
+    paintPlayer();
+  }
+  function pauseAll() {
+    audio.pause();
+    if (shifter && shiftOn) { shifter.disconnect(); shiftOn = false; }
+  }
+  function stopPlay() {
+    pauseAll();
+    dropShifter();
+    decoded = null; // расшифрованный звук занимает много памяти — отпускаем, уходя с песни
+    playing = null;
+  }
+
+  /** Ползунок: запоминает сдвиг; если этот минус играет — меняет тон сразу. */
+  function setPitch(name, n) {
+    pitch[name] = n;
+    save('pitch', pitch);
+    const lbl = document.querySelector(`[data-pitch-label="${CSS.escape(name)}"]`);
+    if (lbl) lbl.textContent = pitchLabel(n);
+    if (playing !== name) return;
+    if (engine === 'shift' && shifter) shifter.pitchSemitones = n;
+    else if (engine === 'audio' && !audio.paused && n !== 0) {
+      const t = audio.currentTime;
+      unlockAudio();
+      audio.pause();
+      engine = 'shift';
+      startShift(name, t);
+    }
+  }
 
   async function shareFile(name) {
     const c = cache[name];
@@ -298,16 +394,16 @@
   /** Обновляет кнопки и полоску плеера без перерисовки всего экрана. */
   function paintPlayer() {
     document.querySelectorAll('[data-act="play"]').forEach((b) => {
-      const on = b.dataset.name === playing && !audio.paused;
+      const on = b.dataset.name === playing && isPlaying();
       b.innerHTML = on ? I.pause : I.play;
       b.setAttribute('aria-label', on ? 'Пауза' : 'Играть');
     });
     document.querySelectorAll('.bar').forEach((bar) => {
       const mine = bar.dataset.name === playing;
-      bar.firstElementChild.style.width = mine && audio.duration ? (audio.currentTime / audio.duration) * 100 + '%' : '0';
+      bar.firstElementChild.style.width = mine && dur() ? (pos() / dur()) * 100 + '%' : '0';
       const t = bar.nextElementSibling;
       const name = bar.dataset.name;
-      if (t) t.textContent = mine ? fmtTime(audio.currentTime) + ' / ' + fmtTime(audio.duration) : loading.has(name) && !cache[name] ? 'Скачиваю…' : '';
+      if (t) t.textContent = mine && dur() ? fmtTime(pos()) + ' / ' + fmtTime(dur()) : loading.has(name) && !cache[name] ? 'Скачиваю…' : '';
     });
   }
   audio.addEventListener('timeupdate', paintPlayer);
@@ -491,7 +587,10 @@
         <div class="mname"><span>${esc(f.name.replace(/\.(mp3|m4a)$/i, ''))}</span>
           <div class="bar" data-act="seek" data-name="${esc(f.name)}"><i></i></div><div class="time"></div></div>
         <button class="ghost" data-act="share" data-name="${esc(f.name)}" aria-label="Переслать">${I.share}</button>
-      </div>`);
+      </div>
+      <div class="pitch"><span class="lbl">Тон</span>
+        <input type="range" min="-6" max="6" step="1" value="${getPitch(f.name)}" data-pitch="${esc(f.name)}" aria-label="Сдвиг тональности минуса">
+        <b data-pitch-label="${esc(f.name)}">${pitchLabel(getPitch(f.name))}</b></div>`);
     if (s.ml) rows.push(`
       <div class="mrow">
         <a class="ghost" href="${esc(web(s.ml) || '#')}" target="_blank" rel="noopener" aria-label="Открыть ссылку">${I.link}</a>
@@ -586,11 +685,19 @@
         toast(v === 'know' ? 'В списке «Знаю»' : v === 'new' ? 'В списке «Новые»' : 'Убрано из списков');
         break;
       }
-      case 'player': st.player = !st.player; if (!st.player) stopPlay(); render(); break;
+      case 'player': st.player = !st.player; if (st.player) unlockAudio(); else stopPlay(); render(); break;
       case 'play': togglePlay(d.name); break;
       case 'share': shareFile(d.name); break;
       case 'share-link': shareLink(d.url, byId(st.cur).t); break;
-      case 'seek': if (d.name === playing && audio.duration) { const r = el.getBoundingClientRect(); audio.currentTime = ((e.clientX - r.left) / r.width) * audio.duration; } break;
+      case 'seek': {
+        if (d.name !== playing || !dur()) break;
+        const r = el.getBoundingClientRect();
+        const k = Math.min(Math.max((e.clientX - r.left) / r.width, 0), 0.999);
+        if (engine === 'shift' && shifter) shifter.percentagePlayed = k;
+        else audio.currentTime = k * audio.duration;
+        paintPlayer();
+        break;
+      }
       case 'sw': st[d.k] = !st[d.k]; st.open = {}; render(); break;
       case 'stanza': if (e.target.closest('a,button')) break; st.open[d.i] = !st.open[d.i]; render(); break;
       case 'pick': st.pick = d.st; el.parentElement.querySelectorAll('button').forEach((b) => (b.className = b === el ? 'on ' + d.st : '')); break;
@@ -604,6 +711,7 @@
 
   document.addEventListener('input', (e) => {
     if (e.target.id === 'q') { st.q = e.target.value; list(); }
+    if (e.target.dataset.pitch) setPitch(e.target.dataset.pitch, parseInt(e.target.value, 10));
     if (e.target.id === 'f-t') document.getElementById('f-err').hidden = true;
   });
 
@@ -757,15 +865,15 @@
   async function boot() {
     let k = null;
     try {
-      const load = Promise.all(['user', 'added', 'parsed', 'minus', 'mt', 'key'].map((x) => DB.get(x)));
+      const load = Promise.all(['user', 'added', 'parsed', 'minus', 'mt', 'key', 'pitch'].map((x) => DB.get(x)));
       // Если хранилище не отвечает (его держит другая вкладка), не висим на «Загружаю…».
       const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error('не отвечает, закрой другие вкладки с приложением')), 5000));
-      [user, added, parsed, minus, mt, k] = await Promise.race([load, timeout]);
+      [user, added, parsed, minus, mt, k, pitch] = await Promise.race([load, timeout]);
       if (k) key = await importKey(k);
     } catch (e) {
       toast('Хранилище телефона: ' + e.message);
     }
-    user = user || {}; added = added || []; parsed = parsed || {}; minus = minus || {}; mt = mt || {};
+    user = user || {}; added = added || []; parsed = parsed || {}; minus = minus || {}; mt = mt || {}; pitch = pitch || {};
     // Стартовые отметки «Знаю/Новые» берутся из каталога, пока Лера их не поменяла.
     route();
     // Новая версия текстов на сайте подтягивается тихо; без интернета просто остаёмся на сохранённой.
